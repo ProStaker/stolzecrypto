@@ -1,0 +1,571 @@
+(function () {
+    const state = {
+        payload: window.STOLZE_PRICE_CHARTS || { assets: [] },
+        bySymbol: new Map(),
+        resizeTimer: null
+    };
+
+    function money(value) {
+        return '$' + Number(value || 0).toLocaleString(locale(), {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2
+        });
+    }
+
+    function jp2Money(value) {
+        const number = Number(value || 0);
+        const sign = number < 0 ? '-' : '';
+        return sign + '₱' + Math.abs(number).toLocaleString(locale(), {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 8
+        });
+    }
+
+    function usdToJp2(value) {
+        return Number(value || 0) / Number(window.STOLZE_JP2_RATE || 21.37);
+    }
+
+    function quantity(value) {
+        const number = Number(value || 0);
+        if (Math.abs(number) >= 1000) {
+            return number.toLocaleString(locale(), {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            });
+        }
+
+        return number.toLocaleString(locale(), {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 6
+        });
+    }
+
+    function percent(value) {
+        const number = Number(value || 0);
+        return (number > 0 ? '+' : '') + number.toFixed(2) + '%';
+    }
+
+    function leverage(value) {
+        return Number(value || 1).toLocaleString(locale(), {
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2
+        }) + 'x';
+    }
+
+    function locale() {
+        return window.STOLZE_LOCALE === 'pl' ? 'pl-PL' : 'en-US';
+    }
+
+    function indexPayload(payload) {
+        state.payload = payload || { assets: [] };
+        state.bySymbol = new Map();
+
+        for (const asset of state.payload.assets || []) {
+            state.bySymbol.set(asset.symbol, asset);
+        }
+    }
+
+    function syncNumbers() {
+        for (const asset of state.bySymbol.values()) {
+            document.querySelectorAll('[data-price-symbol="' + asset.symbol + '"]').forEach((node) => {
+                node.textContent = jp2Money(usdToJp2(asset.price));
+            });
+
+            document.querySelectorAll('[data-change-symbol="' + asset.symbol + '"]').forEach((node) => {
+                node.textContent = percent(asset.change);
+                node.classList.toggle('up', asset.change >= 0);
+                node.classList.toggle('down', asset.change < 0);
+            });
+
+            document.querySelectorAll('[data-chart-min-symbol="' + asset.symbol + '"]').forEach((node) => {
+                node.textContent = jp2Money(usdToJp2(asset.min_price || asset.price));
+            });
+
+            document.querySelectorAll('[data-chart-max-symbol="' + asset.symbol + '"]').forEach((node) => {
+                node.textContent = jp2Money(usdToJp2(asset.max_price || asset.price));
+            });
+        }
+    }
+
+    function syncExchangeStats(stats) {
+    if (!stats) {
+        return;
+    }
+
+		document.querySelectorAll('[data-exchange-stat]').forEach((node) => {
+			const key = node.dataset.exchangeStat;
+			const value = stats[key] || 0;
+
+			node.textContent = node.dataset.statFormat === 'count'
+				? Number(value).toLocaleString(locale(), { maximumFractionDigits: 0 })
+				: money(value);
+		});
+	}
+
+    function drawAll() {
+        document.querySelectorAll('canvas[data-chart-symbol]').forEach((canvas) => {
+            const asset = state.bySymbol.get(canvas.dataset.chartSymbol);
+            if (!asset) {
+                return;
+            }
+            drawChart(canvas, asset, canvas.dataset.chartType === 'large');
+        });
+    }
+
+    function drawChart(canvas, asset, large) {
+        const points = (asset.points || []).map((point) => Number(point.price)).filter((price) => Number.isFinite(price));
+        if (!points.length) {
+            return;
+        }
+
+        canvas.style.width = large ? '100%' : '';
+        canvas.style.height = large ? '150px' : '';
+
+        const rect = canvas.getBoundingClientRect();
+        const cssWidth = large ? Math.max(180, Math.floor(rect.width)) : Math.max(64, Math.floor(rect.width || 130));
+        const cssHeight = large ? 150 : Math.max(32, Math.floor(rect.height || 48));
+        const ratio = window.devicePixelRatio || 1;
+
+        const backingWidth = Math.round(cssWidth * ratio);
+        const backingHeight = Math.round(cssHeight * ratio);
+
+        if (canvas.width !== backingWidth) {
+            canvas.width = backingWidth;
+        }
+        if (canvas.height !== backingHeight) {
+            canvas.height = backingHeight;
+        }
+
+        const ctx = canvas.getContext('2d');
+        ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+        ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+        const styles = getComputedStyle(document.documentElement);
+        const upColor = styles.getPropertyValue('--mint-dark').trim() || '#19745b';
+        const downColor = styles.getPropertyValue('--coral').trim() || '#e95d4f';
+        const gridColor = 'rgba(23, 23, 23, 0.10)';
+        const lineColor = Number(asset.change || 0) >= 0 ? upColor : downColor;
+        const padding = large ? { top: 16, right: 16, bottom: 22, left: 16 } : { top: 6, right: 6, bottom: 6, left: 6 };
+        const width = cssWidth - padding.left - padding.right;
+        const height = cssHeight - padding.top - padding.bottom;
+        let min = Math.min(...points);
+        let max = Math.max(...points);
+
+        if (min === max) {
+            min *= 0.98;
+            max *= 1.02;
+        }
+
+        const range = max - min || 1;
+        const toX = (index) => padding.left + ((points.length === 1 ? 0 : index / (points.length - 1)) * width);
+        const toY = (price) => padding.top + ((max - price) / range) * height;
+
+        if (large) {
+            ctx.strokeStyle = gridColor;
+            ctx.lineWidth = 1;
+            for (let i = 0; i < 4; i++) {
+                const y = padding.top + (height * i / 3);
+                ctx.beginPath();
+                ctx.moveTo(padding.left, y);
+                ctx.lineTo(padding.left + width, y);
+                ctx.stroke();
+            }
+        }
+
+        ctx.beginPath();
+        points.forEach((price, index) => {
+            const x = toX(index);
+            const y = toY(price);
+            if (index === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        });
+
+        if (large) {
+            const gradient = ctx.createLinearGradient(0, padding.top, 0, padding.top + height);
+            gradient.addColorStop(0, lineColor + '44');
+            gradient.addColorStop(1, lineColor + '00');
+
+            ctx.lineTo(padding.left + width, padding.top + height);
+            ctx.lineTo(padding.left, padding.top + height);
+            ctx.closePath();
+            ctx.fillStyle = gradient;
+            ctx.fill();
+
+            ctx.beginPath();
+            points.forEach((price, index) => {
+                const x = toX(index);
+                const y = toY(price);
+                if (index === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            });
+        }
+
+        ctx.strokeStyle = lineColor;
+        ctx.lineWidth = large ? 2.5 : 2;
+        ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
+        ctx.stroke();
+
+        const lastX = toX(points.length - 1);
+        const lastY = toY(points[points.length - 1]);
+        ctx.fillStyle = lineColor;
+        ctx.beginPath();
+        ctx.arc(lastX, lastY, large ? 3.5 : 2.5, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    function render(payload) {
+        indexPayload(payload);
+        syncNumbers();
+        syncExchangeStats(state.payload.exchange_stats);
+        renderCustodyIncidents(state.payload.custody_incidents || []);
+        drawAll();
+    }
+
+    async function refresh() {
+        try {
+            const response = await fetch('api/prices.php?window=90&now=' + Date.now(), {
+                cache: 'no-store',
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) {
+                return;
+            }
+
+            render(await response.json());
+        } catch (error) {
+            // The page remains usable if a polling request misses a tick.
+        }
+    }
+
+    function makeActionForm(action, idName, idValue, label) {
+        const form = document.createElement('form');
+        const csrf = document.createElement('input');
+        const actionInput = document.createElement('input');
+        const idInput = document.createElement('input');
+        const button = document.createElement('button');
+
+        form.method = 'post';
+        form.className = 'table-action-form';
+        csrf.type = 'hidden';
+        csrf.name = 'csrf';
+        csrf.value = window.STOLZE_CSRF || '';
+        actionInput.type = 'hidden';
+        actionInput.name = 'action';
+        actionInput.value = action;
+        idInput.type = 'hidden';
+        idInput.name = idName;
+        idInput.value = String(idValue);
+        button.type = 'submit';
+        button.className = 'secondary';
+        button.textContent = label;
+
+        form.append(csrf, actionInput, idInput, button);
+        return form;
+    }
+
+    function setCellLabel(cell, key) {
+        const labels = (window.STOLZE_WALLET_COPY || {}).labels || {};
+        cell.dataset.label = labels[key] || key;
+        return cell;
+    }
+
+    function renderMarginPositions(positions) {
+        const body = document.querySelector('[data-margin-positions]');
+        const table = document.querySelector('[data-margin-table]');
+        const empty = document.querySelector('[data-margin-empty]');
+        if (!body || !table || !empty) {
+            return;
+        }
+
+        body.innerHTML = '';
+
+        for (const position of positions) {
+            const row = document.createElement('tr');
+            const asset = document.createElement('td');
+            const assetStrong = document.createElement('strong');
+            const side = document.createElement('td');
+            const qty = document.createElement('td');
+            const entry = document.createElement('td');
+            const margin = document.createElement('td');
+            const pnl = document.createElement('td');
+            const liq = document.createElement('td');
+            const action = document.createElement('td');
+
+            setCellLabel(asset, 'asset');
+            setCellLabel(side, 'side');
+            setCellLabel(qty, 'qty');
+            setCellLabel(entry, 'entry');
+            setCellLabel(margin, 'margin');
+            setCellLabel(pnl, 'pl');
+            setCellLabel(liq, 'liquidation');
+            setCellLabel(action, 'actions');
+            assetStrong.textContent = position.symbol;
+            asset.append(assetStrong);
+            side.textContent = position.side_label + ' ' + leverage(position.leverage);
+            qty.textContent = quantity(position.quantity);
+            entry.textContent = jp2Money(usdToJp2(position.entry_price));
+            margin.textContent = jp2Money(position.margin);
+            pnl.textContent = jp2Money(usdToJp2(position.pnl));
+            pnl.className = Number(position.pnl || 0) >= 0 ? 'up' : 'down';
+            liq.textContent = jp2Money(usdToJp2(position.liquidation_price));
+            action.append(makeActionForm('close_margin', 'position_id', position.id, (window.STOLZE_WALLET_COPY || {}).close || 'Close'));
+
+            row.append(asset, side, qty, entry, margin, pnl, liq, action);
+            body.append(row);
+        }
+
+        const hasPositions = positions.length > 0;
+        table.hidden = !hasPositions;
+        empty.hidden = hasPositions;
+    }
+
+    function renderTriggers(triggers) {
+        const body = document.querySelector('[data-trigger-orders]');
+        const table = document.querySelector('[data-trigger-table]');
+        const empty = document.querySelector('[data-trigger-empty]');
+        if (!body || !table || !empty) {
+            return;
+        }
+
+        body.innerHTML = '';
+
+        for (const trigger of triggers) {
+            const row = document.createElement('tr');
+            const asset = document.createElement('td');
+            const assetStrong = document.createElement('strong');
+            const side = document.createElement('td');
+            const qty = document.createElement('td');
+            const when = document.createElement('td');
+            const price = document.createElement('td');
+            const action = document.createElement('td');
+
+            setCellLabel(asset, 'asset');
+            setCellLabel(side, 'side');
+            setCellLabel(qty, 'orderSize');
+            setCellLabel(when, 'when');
+            setCellLabel(price, 'price');
+            setCellLabel(action, 'actions');
+            assetStrong.textContent = trigger.symbol;
+            asset.append(assetStrong);
+            side.textContent = trigger.side_label || trigger.side || '';
+            qty.textContent = trigger.side === 'buy' ? jp2Money(trigger.amount_cash) : quantity(trigger.quantity);
+            when.textContent = trigger.direction_label + ' ' + jp2Money(usdToJp2(trigger.target_price));
+            price.textContent = jp2Money(usdToJp2(trigger.current_price));
+            action.append(makeActionForm('cancel_trigger', 'trigger_id', trigger.id, (window.STOLZE_WALLET_COPY || {}).cancel || 'Cancel'));
+
+            row.append(asset, side, qty, when, price, action);
+            body.append(row);
+        }
+
+        const hasTriggers = triggers.length > 0;
+        table.hidden = !hasTriggers;
+        empty.hidden = hasTriggers;
+    }
+
+    function renderCustodyIncidents(incidents) {
+        const list = document.querySelector('[data-custody-incidents]');
+        const empty = document.querySelector('[data-custody-empty]');
+        if (!list || !empty || !Array.isArray(incidents)) {
+            return;
+        }
+
+        list.innerHTML = '';
+
+        for (const incident of incidents) {
+            const row = document.createElement('li');
+            const title = document.createElement('strong');
+            const detail = document.createElement('span');
+
+            title.textContent = incident.title || '';
+            detail.textContent = incident.adjustment || '';
+            row.append(title, detail);
+            list.append(row);
+        }
+
+        const hasIncidents = incidents.length > 0;
+        list.hidden = !hasIncidents;
+        empty.hidden = hasIncidents;
+    }
+
+    function renderWallet(payload) {
+        if (!payload || payload.authenticated === false) {
+            return;
+        }
+
+        document.querySelectorAll('[data-wallet-cash]').forEach((node) => {
+            node.textContent = jp2Money(payload.cash);
+        });
+        document.querySelectorAll('[data-wallet-equity]').forEach((node) => {
+            node.textContent = money(payload.equity);
+        });
+        document.querySelectorAll('[data-deposit-remaining]').forEach((node) => {
+            node.textContent = money(payload.deposit_remaining);
+        });
+        document.querySelectorAll('.deposit-panel input[name="amount"]').forEach((node) => {
+            node.max = Number(payload.deposit_remaining || 0).toFixed(2);
+        });
+
+        const body = document.querySelector('[data-wallet-positions]');
+        const table = document.querySelector('[data-wallet-table]');
+        const empty = document.querySelector('[data-wallet-empty]');
+        if (!body || !table || !empty) {
+            return;
+        }
+
+        const positions = payload.positions || [];
+        body.innerHTML = '';
+
+        for (const position of positions) {
+            const row = document.createElement('tr');
+            const asset = document.createElement('td');
+            const assetStrong = document.createElement('strong');
+            const qty = document.createElement('td');
+            const value = document.createElement('td');
+            const gain = document.createElement('td');
+            const actions = document.createElement('td');
+
+            setCellLabel(asset, 'asset');
+            setCellLabel(qty, 'qty');
+            setCellLabel(value, 'value');
+            setCellLabel(gain, 'pl');
+            setCellLabel(actions, 'actions');
+            assetStrong.textContent = position.symbol;
+            asset.append(assetStrong);
+            qty.textContent = quantity(position.quantity);
+            value.textContent = jp2Money(usdToJp2(position.value));
+            gain.textContent = percent(position.gain);
+            gain.className = Number(position.gain || 0) >= 0 ? 'up' : 'down';
+            actions.append(makeActionForm('sell_all', 'asset_id', position.asset_id, (window.STOLZE_WALLET_COPY || {}).sellAll || 'Sell all'));
+
+            row.append(asset, qty, value, gain, actions);
+            body.append(row);
+        }
+
+        const hasPositions = positions.length > 0;
+        table.hidden = !hasPositions;
+        empty.hidden = hasPositions;
+
+        renderMarginPositions(payload.margin_positions || []);
+        renderTriggers(payload.triggers || []);
+    }
+
+    async function refreshWallet() {
+        if (!document.querySelector('[data-wallet-equity]')) {
+            return;
+        }
+
+        try {
+            const response = await fetch('api/wallet.php?now=' + Date.now(), {
+                cache: 'no-store',
+                headers: { Accept: 'application/json' }
+            });
+            if (!response.ok) {
+                return;
+            }
+
+            renderWallet(await response.json());
+        } catch (error) {
+            // Wallet values keep their previous render if a refresh is missed.
+        }
+    }
+
+    function bindResize() {
+        window.addEventListener('resize', () => {
+            clearTimeout(state.resizeTimer);
+            state.resizeTimer = window.setTimeout(() => drawAll(), 120);
+        });
+    }
+
+    function bindSpotTradeForms() {
+        document.querySelectorAll('form').forEach((form) => {
+            const action = form.querySelector('input[name="action"][value="create_trigger"]');
+            const side = form.querySelector('select[name="side"]');
+            const direction = form.querySelector('select[name="direction"]');
+            const targetPrice = form.querySelector('input[name="target_price"]');
+            const orderAmount = form.querySelector('input[name="order_amount"]');
+            const buyAnyPrice = form.querySelector('[data-buy-any-price]');
+            const buyAnyRow = form.querySelector('[data-buy-any-price-row]');
+            const conditionalControls = form.querySelectorAll('[data-trigger-conditional-control]');
+            const conditionalRow = targetPrice ? targetPrice.closest('.form-row') : null;
+            const amountLabel = form.querySelector('[data-trigger-amount-label]');
+            const amountHint = form.querySelector('[data-trigger-amount-hint]');
+            const submit = form.querySelector('[data-trigger-submit]');
+            if (!action || !side || !orderAmount) {
+                return;
+            }
+
+            const sync = () => {
+                const isBuy = side.value === 'buy';
+                if (!isBuy && buyAnyPrice) {
+                    buyAnyPrice.checked = false;
+                }
+                const isBuyAnyPrice = Boolean(isBuy && buyAnyPrice && buyAnyPrice.checked);
+                orderAmount.min = isBuy ? '0.01' : '0.000001';
+                orderAmount.step = isBuy ? '0.01' : '0.000001';
+                if (buyAnyRow) {
+                    buyAnyRow.hidden = !isBuy;
+                }
+                if (targetPrice) {
+                    targetPrice.disabled = isBuyAnyPrice;
+                    targetPrice.required = !isBuyAnyPrice;
+                }
+                if (direction) {
+                    direction.disabled = isBuyAnyPrice;
+                }
+                conditionalControls.forEach((node) => {
+                    node.hidden = isBuyAnyPrice;
+                    node.classList.toggle('is-hidden', isBuyAnyPrice);
+                });
+                if (conditionalRow) {
+                    conditionalRow.classList.toggle('buy-any-price-active', isBuyAnyPrice);
+                }
+                if (amountLabel) {
+                    amountLabel.textContent = (isBuy ? amountLabel.dataset.buyLabel : amountLabel.dataset.sellLabel) || amountLabel.textContent;
+                }
+                if (amountHint) {
+                    amountHint.textContent = (isBuy ? amountHint.dataset.buyHint : amountHint.dataset.sellHint) || amountHint.textContent;
+                }
+                if (submit) {
+                    submit.textContent = isBuyAnyPrice ? (submit.dataset.buyLabel || 'Buy') : (submit.dataset.createLabel || submit.textContent);
+                }
+                if (direction && !direction.dataset.touched) {
+                    direction.value = isBuy ? 'below' : 'above';
+                }
+            };
+
+            side.addEventListener('change', sync);
+            if (buyAnyPrice) {
+                buyAnyPrice.addEventListener('change', sync);
+            }
+            if (direction) {
+                direction.addEventListener('change', () => {
+                    direction.dataset.touched = '1';
+                });
+            }
+            sync();
+        });
+    }
+
+    function start() {
+        render(state.payload);
+        bindResize();
+        bindSpotTradeForms();
+        window.setInterval(() => {
+            refresh();
+            refreshWallet();
+        }, 2000);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
+    } else {
+        start();
+    }
+}());
